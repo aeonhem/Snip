@@ -143,17 +143,37 @@ class TrayApp : ApplicationContext
     }
 }
 
-class Stroke
+enum Kind { Pen, Arrow, Box, Circle }
+
+class Mark
 {
+    public Kind Kind;
     public Color Color;
     public float Width;
-    public List<PointF> Points = new List<PointF>();
+    public List<PointF> Points = new List<PointF>(); // pen only
+    public PointF A, B;   // arrow: A = tail, B = tip. Box and circle: opposite corners.
+
+    public Mark Copy()
+    {
+        Mark m = (Mark)MemberwiseClone();
+        m.Points = new List<PointF>(Points);
+        return m;
+    }
+
+    public void CopyFrom(Mark o)
+    {
+        Kind = o.Kind; Color = o.Color; Width = o.Width; A = o.A; B = o.B;
+        Points = new List<PointF>(o.Points);
+    }
 }
 
 class UndoEntry
 {
-    public Stroke Stroke;         // set when a stroke was added
-    public Rectangle PrevCrop;    // used when Stroke is null (a crop change)
+    public Mark Mark;           // the mark that was added, changed or deleted
+    public Mark Before;         // set when the mark was changed: its old state
+    public int DeletedIndex = -1; // set when the mark was deleted: where it was
+    public bool IsCrop;
+    public Rectangle PrevCrop;
 }
 
 class NoFocusButton : Button
@@ -172,30 +192,34 @@ class NoFocusButton : Button
     }
 }
 
-enum Tool { Crop, Pen }
+enum Tool { Crop, Pen, Arrow, Box, Circle }
+enum DragMode { None, Crop, Pen, NewShape, Move, Handle }
 
 class EditorForm : Form
 {
     readonly Bitmap img;
-    readonly List<Stroke> strokes = new List<Stroke>();
+    readonly List<Mark> marks = new List<Mark>();
     readonly List<UndoEntry> undo = new List<UndoEntry>();
     Rectangle crop = Rectangle.Empty;    // in image pixels; Empty = whole image
     Tool tool = Tool.Crop;
     Color color = Color.Red;
     float width = 6;
 
-    Stroke current;                      // stroke being drawn
-    bool dragging;
-    PointF dragStart, dragNow;           // image coordinates, for crop
+    DragMode drag = DragMode.None;
+    Mark live;                           // mark being drawn or changed; drawn on top, not cached
+    Mark before;                         // copy of live at drag start, for undo
+    Mark selected;                       // shape with handles; can be moved, resized, recoloured
+    int handle;
+    PointF dragStart, dragNow, lastP;    // image coordinates
 
     readonly FlowLayoutPanel bar;
-    NoFocusButton cropBtn, penBtn;
+    readonly Dictionary<Tool, NoFocusButton> toolBtns = new Dictionary<Tool, NoFocusButton>();
     readonly List<NoFocusButton> colorBtns = new List<NoFocusButton>();
     readonly List<NoFocusButton> sizeBtns = new List<NoFocusButton>();
 
     RectangleF view;                     // where the image is shown on the form
     float scale = 1;
-    Bitmap cache;                        // image + finished strokes, at view size
+    Bitmap cache;                        // image + finished marks, at view size
 
     public string SavedPath { get; private set; }
 
@@ -216,19 +240,22 @@ class EditorForm : Form
         bar = new FlowLayoutPanel();
         bar.Dock = DockStyle.Top;
         bar.AutoSize = true;
-        bar.WrapContents = false;
+        bar.WrapContents = true;
         bar.BackColor = Color.FromArgb(45, 45, 45);
         bar.Padding = new Padding(8, 4, 8, 4);
         bar.Cursor = Cursors.Default;
         Controls.Add(bar);
 
-        cropBtn = AddButton("Crop (C)", delegate { SetTool(Tool.Crop); });
-        penBtn = AddButton("Pen (P)", delegate { SetTool(Tool.Pen); });
+        AddToolButton(Tool.Crop, "Crop (C)");
+        AddToolButton(Tool.Pen, "Pen (P)");
+        AddToolButton(Tool.Arrow, "Arrow (A)");
+        AddToolButton(Tool.Box, "Box (R)");
+        AddToolButton(Tool.Circle, "Circle (O)");
         AddGap();
         foreach (Color c in new Color[] { Color.Red, Color.Yellow, Color.Lime, Color.DodgerBlue, Color.White })
         {
             Color cc = c;
-            NoFocusButton b = AddButton("", delegate { color = cc; SetTool(Tool.Pen); UpdateButtons(); });
+            NoFocusButton b = AddButton("", delegate { color = cc; ApplyStyle(); });
             b.AutoSize = false;
             b.Size = new Size(bar.Font.Height + 14, bar.Font.Height + 14);
             b.BackColor = c;
@@ -239,12 +266,13 @@ class EditorForm : Form
         foreach (object[] s in new object[][] { new object[] { "Thin", 3f }, new object[] { "Medium", 6f }, new object[] { "Thick", 12f } })
         {
             float w = (float)s[1];
-            NoFocusButton b = AddButton((string)s[0], delegate { width = w; SetTool(Tool.Pen); UpdateButtons(); });
+            NoFocusButton b = AddButton((string)s[0], delegate { width = w; ApplyStyle(); });
             b.Tag = w;
             sizeBtns.Add(b);
         }
         AddGap();
         AddButton("Undo (Ctrl+Z)", delegate { Undo(); });
+        AddButton("Delete (Del)", delegate { DeleteSelected(); });
         AddGap();
         AddButton("Cancel (Esc)", delegate { Close(); });
         NoFocusButton done = AddButton("Done (Enter)", delegate { Finish(); });
@@ -252,6 +280,11 @@ class EditorForm : Form
         done.FlatAppearance.BorderColor = done.BackColor;
 
         UpdateButtons();
+    }
+
+    void AddToolButton(Tool t, string text)
+    {
+        toolBtns[t] = AddButton(text, delegate { SetTool(t); });
     }
 
     NoFocusButton AddButton(string text, EventHandler click)
@@ -270,9 +303,30 @@ class EditorForm : Form
         bar.Controls.Add(p);
     }
 
+    static bool IsShapeTool(Tool t) { return t == Tool.Arrow || t == Tool.Box || t == Tool.Circle; }
+
     void SetTool(Tool t)
     {
         tool = t;
+        if (!IsShapeTool(t)) selected = null;
+        UpdateButtons();
+        Invalidate();
+    }
+
+    // A colour or size click changes the selected shape, or else what you draw next.
+    void ApplyStyle()
+    {
+        if (selected != null && (selected.Color != color || selected.Width != width))
+        {
+            UndoEntry u = new UndoEntry();
+            u.Mark = selected;
+            u.Before = selected.Copy();
+            undo.Add(u);
+            selected.Color = color;
+            selected.Width = width;
+            DropCache();
+        }
+        else if (tool == Tool.Crop) SetTool(Tool.Pen);
         UpdateButtons();
     }
 
@@ -280,8 +334,8 @@ class EditorForm : Form
     {
         Color on = Color.Orange;
         Color off = Color.FromArgb(60, 60, 60);
-        cropBtn.FlatAppearance.BorderColor = tool == Tool.Crop ? on : off;
-        penBtn.FlatAppearance.BorderColor = tool == Tool.Pen ? on : off;
+        foreach (KeyValuePair<Tool, NoFocusButton> kv in toolBtns)
+            kv.Value.FlatAppearance.BorderColor = kv.Key == tool ? on : off;
         foreach (NoFocusButton b in colorBtns)
             b.FlatAppearance.BorderColor = (Color)b.Tag == color ? on : off;
         foreach (NoFocusButton b in sizeBtns)
@@ -325,85 +379,275 @@ class EditorForm : Form
         return new Rectangle(x1, y1, x2 - x1, y2 - y1);
     }
 
-    static void DrawStroke(Graphics g, Stroke s)
+    static RectangleF Box(Mark m)
     {
-        if (s.Points.Count == 1)
+        return RectangleF.FromLTRB(Math.Min(m.A.X, m.B.X), Math.Min(m.A.Y, m.B.Y), Math.Max(m.A.X, m.B.X), Math.Max(m.A.Y, m.B.Y));
+    }
+
+    static float Dist(PointF a, PointF b)
+    {
+        float dx = a.X - b.X, dy = a.Y - b.Y;
+        return (float)Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    // Arrow head grows with the arrow's length and thickness, within limits.
+    static float HeadLength(Mark m)
+    {
+        float len = Dist(m.A, m.B);
+        return Math.Min(len, Math.Max(m.Width * 3, Math.Min(len * 0.35f, m.Width * 4 + 24)));
+    }
+
+    static void DrawMark(Graphics g, Mark m)
+    {
+        if (m.Kind == Kind.Pen)
         {
-            PointF p = s.Points[0];
-            using (Brush b = new SolidBrush(s.Color))
-                g.FillEllipse(b, p.X - s.Width / 2, p.Y - s.Width / 2, s.Width, s.Width);
+            if (m.Points.Count == 1)
+            {
+                PointF p = m.Points[0];
+                using (Brush b = new SolidBrush(m.Color))
+                    g.FillEllipse(b, p.X - m.Width / 2, p.Y - m.Width / 2, m.Width, m.Width);
+                return;
+            }
+            using (Pen pen = RoundPen(m))
+                g.DrawLines(pen, m.Points.ToArray());
             return;
         }
-        using (Pen pen = new Pen(s.Color, s.Width))
+        if (m.Kind == Kind.Box || m.Kind == Kind.Circle)
         {
-            pen.StartCap = LineCap.Round;
-            pen.EndCap = LineCap.Round;
-            pen.LineJoin = LineJoin.Round;
-            g.DrawLines(pen, s.Points.ToArray());
+            RectangleF r = Box(m);
+            using (Pen pen = RoundPen(m))
+            {
+                if (m.Kind == Kind.Box) g.DrawRectangle(pen, r.X, r.Y, r.Width, r.Height);
+                else g.DrawEllipse(pen, r);
+            }
+            return;
         }
+        // Arrow: a shaft from A, and a filled head that ends at B.
+        float len = Dist(m.A, m.B);
+        if (len < 1) return;
+        float ux = (m.B.X - m.A.X) / len, uy = (m.B.Y - m.A.Y) / len;
+        float head = HeadLength(m), half = head * 0.55f;
+        PointF baseP = new PointF(m.B.X - ux * head, m.B.Y - uy * head);
+        PointF shaftEnd = new PointF(baseP.X + ux * head * 0.2f, baseP.Y + uy * head * 0.2f);
+        using (Pen pen = RoundPen(m))
+        {
+            pen.EndCap = LineCap.Flat;
+            if (Dist(m.A, shaftEnd) > 0.5f && head < len) g.DrawLine(pen, m.A, shaftEnd);
+        }
+        using (Brush b = new SolidBrush(m.Color))
+            g.FillPolygon(b, new PointF[] {
+                m.B,
+                new PointF(baseP.X - uy * half, baseP.Y + ux * half),
+                new PointF(baseP.X + uy * half, baseP.Y - ux * half) });
+    }
+
+    static Pen RoundPen(Mark m)
+    {
+        Pen pen = new Pen(m.Color, m.Width);
+        pen.StartCap = LineCap.Round;
+        pen.EndCap = LineCap.Round;
+        pen.LineJoin = LineJoin.Round;
+        return pen;
+    }
+
+    // Handles: arrow = tail and tip; box and circle = four corners.
+    static PointF[] Handles(Mark m)
+    {
+        if (m.Kind == Kind.Arrow) return new PointF[] { m.A, m.B };
+        return new PointF[] { m.A, new PointF(m.B.X, m.A.Y), new PointF(m.A.X, m.B.Y), m.B };
+    }
+
+    static void MoveHandle(Mark m, int i, PointF p)
+    {
+        if (m.Kind == Kind.Arrow) { if (i == 0) m.A = p; else m.B = p; return; }
+        if (i == 0) m.A = p;
+        else if (i == 1) { m.B.X = p.X; m.A.Y = p.Y; }
+        else if (i == 2) { m.A.X = p.X; m.B.Y = p.Y; }
+        else m.B = p;
+    }
+
+    float Tolerance { get { return 10 / scale; } } // 10 screen pixels, in image pixels
+
+    int HitHandle(PointF p)
+    {
+        if (selected == null) return -1;
+        PointF[] hs = Handles(selected);
+        for (int i = 0; i < hs.Length; i++)
+            if (Dist(hs[i], p) <= Tolerance) return i;
+        return -1;
+    }
+
+    bool HitBody(Mark m, PointF p)
+    {
+        float tol = Tolerance + m.Width / 2;
+        if (m.Kind == Kind.Arrow)
+        {
+            if (Dist(p, m.B) <= HeadLength(m)) return true;
+            float len = Dist(m.A, m.B);
+            if (len < 1) return Dist(p, m.A) <= tol;
+            float t = ((p.X - m.A.X) * (m.B.X - m.A.X) + (p.Y - m.A.Y) * (m.B.Y - m.A.Y)) / (len * len);
+            t = Math.Max(0, Math.Min(1, t));
+            return Dist(p, new PointF(m.A.X + t * (m.B.X - m.A.X), m.A.Y + t * (m.B.Y - m.A.Y))) <= tol;
+        }
+        RectangleF r = Box(m);
+        if (m.Kind == Kind.Box)
+        {
+            RectangleF outer = r, inner = r;
+            outer.Inflate(tol, tol);
+            inner.Inflate(-tol, -tol);
+            return outer.Contains(p) && !inner.Contains(p); // only the edge, so you can draw inside a box
+        }
+        float rx = r.Width / 2, ry = r.Height / 2;
+        if (rx < 1 || ry < 1) return Dist(p, new PointF(r.X + rx, r.Y + ry)) <= tol;
+        float dx = (p.X - r.X - rx) / rx, dy = (p.Y - r.Y - ry) / ry;
+        return Math.Abs(Math.Sqrt(dx * dx + dy * dy) - 1) * Math.Min(rx, ry) <= tol;
+    }
+
+    Mark HitShape(PointF p)
+    {
+        for (int i = marks.Count - 1; i >= 0; i--)
+            if (marks[i].Kind != Kind.Pen && HitBody(marks[i], p)) return marks[i];
+        return null;
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left || !view.Contains(e.Location)) return;
-        dragging = true;
         PointF p = ToImage(e.Location);
-        if (tool == Tool.Pen)
+        lastP = p;
+        if (tool == Tool.Crop)
         {
-            current = new Stroke();
-            current.Color = color;
-            current.Width = width;
-            current.Points.Add(p);
+            drag = DragMode.Crop;
+            dragStart = dragNow = p;
+        }
+        else if (tool == Tool.Pen)
+        {
+            drag = DragMode.Pen;
+            live = NewMark(Kind.Pen);
+            live.Points.Add(p);
         }
         else
         {
-            dragStart = dragNow = p;
+            int h = HitHandle(p);
+            Mark hit = h >= 0 ? selected : HitShape(p);
+            if (hit != null)
+            {
+                drag = h >= 0 ? DragMode.Handle : DragMode.Move;
+                handle = h;
+                selected = live = hit;
+                before = hit.Copy();
+            }
+            else
+            {
+                drag = DragMode.NewShape;
+                selected = null;
+                live = NewMark(tool == Tool.Arrow ? Kind.Arrow : tool == Tool.Box ? Kind.Box : Kind.Circle);
+                live.A = live.B = p;
+            }
         }
-        Invalidate();
+        DropCache();
+    }
+
+    Mark NewMark(Kind k)
+    {
+        Mark m = new Mark();
+        m.Kind = k;
+        m.Color = color;
+        m.Width = width;
+        return m;
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        if (!dragging) return;
         PointF p = ToImage(e.Location);
-        if (current != null) current.Points.Add(p);
-        else dragNow = p;
+        switch (drag)
+        {
+            case DragMode.None:
+                bool over = IsShapeTool(tool) && view.Contains(e.Location) && (HitHandle(p) >= 0 || HitShape(p) != null);
+                Cursor = over ? Cursors.SizeAll : Cursors.Cross;
+                return;
+            case DragMode.Crop: dragNow = p; break;
+            case DragMode.Pen: live.Points.Add(p); break;
+            case DragMode.NewShape: live.B = p; break;
+            case DragMode.Handle: MoveHandle(live, handle, p); break;
+            case DragMode.Move:
+                float dx = p.X - lastP.X, dy = p.Y - lastP.Y;
+                live.A = new PointF(live.A.X + dx, live.A.Y + dy);
+                live.B = new PointF(live.B.X + dx, live.B.Y + dy);
+                break;
+        }
+        lastP = p;
         Invalidate();
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
-        if (!dragging) return;
-        dragging = false;
-        if (current != null)
+        DragMode d = drag;
+        drag = DragMode.None;
+        if (d == DragMode.Crop)
         {
-            strokes.Add(current);
-            UndoEntry u = new UndoEntry();
-            u.Stroke = current;
-            undo.Add(u);
-            current = null;
-            DropCache();
-            return;
+            Rectangle r = RectFrom(dragStart, dragNow);
+            if (r.Width >= 8 && r.Height >= 8)
+            {
+                UndoEntry u = new UndoEntry();
+                u.IsCrop = true;
+                u.PrevCrop = crop;
+                undo.Add(u);
+                crop = r;
+                SetTool(Tool.Pen); // like a phone: crop first, then mark
+            }
         }
-        Rectangle r = RectFrom(dragStart, dragNow);
-        if (r.Width >= 8 && r.Height >= 8)
+        else if (d == DragMode.Pen || d == DragMode.NewShape)
         {
-            UndoEntry u = new UndoEntry();
-            u.PrevCrop = crop;
-            undo.Add(u);
-            crop = r;
-            SetTool(Tool.Pen); // like a phone: crop first, then mark
+            if (d == DragMode.Pen || Dist(live.A, live.B) * scale >= 6) // ignore a click with no drag
+            {
+                marks.Add(live);
+                UndoEntry u = new UndoEntry();
+                u.Mark = live;
+                undo.Add(u);
+                if (d == DragMode.NewShape) selected = live;
+            }
         }
-        Invalidate();
+        else if (d == DragMode.Move || d == DragMode.Handle)
+        {
+            if (live.A != before.A || live.B != before.B)
+            {
+                UndoEntry u = new UndoEntry();
+                u.Mark = live;
+                u.Before = before;
+                undo.Add(u);
+            }
+        }
+        live = null;
+        before = null;
+        DropCache();
+    }
+
+    void DeleteSelected()
+    {
+        if (selected == null) return;
+        UndoEntry u = new UndoEntry();
+        u.Mark = selected;
+        u.DeletedIndex = marks.IndexOf(selected);
+        undo.Add(u);
+        marks.Remove(selected);
+        selected = null;
+        DropCache();
     }
 
     void Undo()
     {
-        if (undo.Count == 0) return;
+        if (drag != DragMode.None || undo.Count == 0) return;
         UndoEntry u = undo[undo.Count - 1];
         undo.RemoveAt(undo.Count - 1);
-        if (u.Stroke != null) strokes.Remove(u.Stroke);
-        else crop = u.PrevCrop;
+        if (u.IsCrop) crop = u.PrevCrop;
+        else if (u.DeletedIndex >= 0) marks.Insert(Math.Min(u.DeletedIndex, marks.Count), u.Mark);
+        else if (u.Before != null) u.Mark.CopyFrom(u.Before);
+        else
+        {
+            marks.Remove(u.Mark);
+            if (selected == u.Mark) selected = null;
+        }
         DropCache();
     }
 
@@ -422,21 +666,21 @@ class EditorForm : Form
                 cg.DrawImage(img, new Rectangle(0, 0, cache.Width, cache.Height));
                 cg.SmoothingMode = SmoothingMode.AntiAlias;
                 cg.ScaleTransform(scale, scale);
-                foreach (Stroke s in strokes) DrawStroke(cg, s);
+                foreach (Mark m in marks) if (m != live) DrawMark(cg, m);
             }
         }
         g.DrawImageUnscaled(cache, (int)view.X, (int)view.Y);
 
-        if (current != null)
+        if (live != null)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TranslateTransform(view.X, view.Y);
             g.ScaleTransform(scale, scale);
-            DrawStroke(g, current);
+            DrawMark(g, live);
             g.ResetTransform();
         }
 
-        Rectangle shown = (dragging && current == null) ? RectFrom(dragStart, dragNow) : crop;
+        Rectangle shown = drag == DragMode.Crop ? RectFrom(dragStart, dragNow) : crop;
         if (!shown.IsEmpty)
         {
             RectangleF c = ToView(shown);
@@ -452,6 +696,17 @@ class EditorForm : Form
                 g.DrawRectangle(p, c.X, c.Y, c.Width, c.Height);
             }
         }
+
+        if (selected != null && drag != DragMode.NewShape)
+        {
+            g.SmoothingMode = SmoothingMode.None;
+            foreach (PointF h in Handles(selected))
+            {
+                float x = view.X + h.X * scale - 6, y = view.Y + h.Y * scale - 6;
+                g.FillRectangle(Brushes.White, x, y, 12, 12);
+                g.DrawRectangle(Pens.Black, x, y, 12, 12);
+            }
+        }
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -461,8 +716,12 @@ class EditorForm : Form
             case Keys.Enter: Finish(); return true;
             case Keys.Escape: Close(); return true;
             case Keys.Control | Keys.Z: Undo(); return true;
+            case Keys.Delete: case Keys.Back: DeleteSelected(); return true;
             case Keys.C: SetTool(Tool.Crop); return true;
             case Keys.P: SetTool(Tool.Pen); return true;
+            case Keys.A: SetTool(Tool.Arrow); return true;
+            case Keys.R: SetTool(Tool.Box); return true;
+            case Keys.O: SetTool(Tool.Circle); return true;
         }
         return base.ProcessCmdKey(ref msg, keyData);
     }
@@ -477,7 +736,7 @@ class EditorForm : Form
                 {
                     g.DrawImage(img, new Rectangle(0, 0, img.Width, img.Height));
                     g.SmoothingMode = SmoothingMode.AntiAlias;
-                    foreach (Stroke s in strokes) DrawStroke(g, s);
+                    foreach (Mark m in marks) DrawMark(g, m);
                 }
                 Rectangle area = crop.IsEmpty ? new Rectangle(0, 0, img.Width, img.Height) : crop;
                 using (Bitmap result = full.Clone(area, PixelFormat.Format32bppArgb))

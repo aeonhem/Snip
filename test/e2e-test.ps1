@@ -36,6 +36,15 @@ Drag $h @(@(600, 400), @(700, 450))                          # extra line, then 
 [W]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero); [W]::keybd_event(0x5A, 0, 0, [UIntPtr]::Zero)
 [W]::keybd_event(0x5A, 0, 2, [UIntPtr]::Zero); [W]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
 Start-Sleep -Milliseconds 300
+function Key($vk) { [W]::PostMessage($h, 0x100, [IntPtr]$vk, [IntPtr]0) | Out-Null; Start-Sleep -Milliseconds 200 }
+Key 0x41                                                     # A = arrow tool
+Drag $h @(@(1200, 750), @(1100, 680), @(1000, 600))          # place arrow
+Drag $h @(@(1000, 600), @(950, 450))                         # drag its tip: rotate and lengthen
+Drag $h @(@(1075, 600), @(1125, 600))                        # drag its middle: move right
+Key 0x52                                                     # R = box tool
+Drag $h @(@(550, 650), @(650, 700), @(750, 780))
+Key 0x4F                                                     # O = circle tool
+Drag $h @(@(1050, 330), @(1150, 400), @(1250, 450))
 [W]::PostMessage($h, 0x100, [IntPtr]0x0D, [IntPtr]0) | Out-Null  # Enter = Done
 Start-Sleep 2
 
