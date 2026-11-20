@@ -50,8 +50,22 @@ class TrayApp : ApplicationContext
     {
         invoker.CreateControl();
         hookProc = OnKey;
-        using (Process p = Process.GetCurrentProcess())
-            hook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(p.MainModule.ModuleName), 0);
+        hook = InstallHook();
+
+        // Windows silently removes a low-level hook if one key event takes too long
+        // (LowLevelHooksTimeout), for example when the PC is busy. Print Screen then
+        // stops working with no error. Put a fresh hook in place every 10 seconds.
+        System.Windows.Forms.Timer rehook = new System.Windows.Forms.Timer();
+        rehook.Interval = 10000;
+        rehook.Tick += delegate
+        {
+            IntPtr fresh = InstallHook();
+            if (fresh == IntPtr.Zero) return;
+            IntPtr old = hook;
+            hook = fresh;
+            if (old != IntPtr.Zero) Native.UnhookWindowsHookEx(old);
+        };
+        rehook.Start();
 
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("Take screenshot (Print Screen)", null, delegate { DelayedCapture(); });
@@ -70,6 +84,12 @@ class TrayApp : ApplicationContext
             tray.ShowBalloonTip(8000, "Snip", "Snip could not take over the Print Screen key. Use the tray icon instead.", ToolTipIcon.Warning);
         else if (WindowsSnipKeyOn())
             tray.ShowBalloonTip(10000, "Snip", "Windows also uses Print Screen for its Snipping Tool. Turn it off: Settings > Accessibility > Keyboard > \"Use the Print screen key to open screen capture\".", ToolTipIcon.Info);
+    }
+
+    IntPtr InstallHook()
+    {
+        using (Process p = Process.GetCurrentProcess())
+            return Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(p.MainModule.ModuleName), 0);
     }
 
     static bool WindowsSnipKeyOn()
